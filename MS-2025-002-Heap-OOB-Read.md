@@ -349,3 +349,31 @@ auto ret = common::huge_memcpy(tensor_data_buf, tensor_info->DataNBytes(),
 - CVE-2023-25801 (TensorFlow TFLite OOB read): https://nvd.nist.gov/vuln/detail/CVE-2023-25801
 - memcpy_s 规范说明：仅校验目标缓冲区大小，不校验源地址合法性
 - MindSpore 安全政策: https://gitee.com/mindspore/community/blob/master/security/README.md
+
+---
+
+## 附录 A: 漏洞复现截图
+
+[在此粘贴 image2 截图]
+
+图 A-1: MS-2025-002 堆越界读取漏洞复现（Segmentation fault）。构造恶意模型文件，外部数据文件 data.bin 仅 64 字节，但 external_data.offset 设置为 0x7FFFFFFF（2147483647），远超文件实际大小。MindSpore 2.9.0 加载该模型后，data + offset 指针指向未映射的内存页面，触发 Segmentation fault，进程立即终止。证明攻击者可通过控制 offset 值导致拒绝服务（DoS）。
+
+[在此粘贴 image3 截图]
+
+图 A-2: MS-2025-002 Valgrind 内存错误精确检测。使用 PYTHONMALLOC=malloc valgrind --tool=memcheck 运行 MindSpore 加载恶意模型（offset=128，文件大小 64 字节），Valgrind 检测到多次 "Invalid read of size 8"。调用栈清晰显示越界读取发生在 memmove -> memcpy_s (libmindspore_frontend.so) -> libmindspore_core.so 中的函数，与源码中 GetTensorDataFromExternal() 通过 huge_memcpy 调用 memcpy_s 的执行路径完全吻合，确认堆越界读取真实发生且调用链与代码分析一致。
+
+---
+
+## 附录 B: 漏洞源码截图
+
+[在此粘贴源码截图: 第 1075 行附近 else if (weight_buffer_.first == nullptr)]
+
+图 B-1: 文件读取分支入口。当 weight_buffer_ 为空（即未通过外部 buffer 传入权重数据）时，进入文件读取路径。该路径中完全缺少对 offset + length 是否超出文件大小的边界校验，是本漏洞的触发前提。
+
+[在此粘贴源码截图: 第 1107 行附近 weight_buffer_ 分支有检查]
+
+图 B-2: 安全逻辑不一致对比。weight_buffer_ 分支中明确存在 if (LongToSize(offset() + length()) > weight_buffer_.second) 的边界校验逻辑，超出范围时返回 false 并记录错误日志。但文件读取分支（图 B-1）完全缺少同等检查，属于开发过程中的安全逻辑遗漏。
+
+[在此粘贴源码截图: 第 1125 行附近 auto ret = common::huge_memcpy(...)]
+
+图 B-3: 越界触发点。data + tensor_proto.external_data().offset() 中 offset 以 int64_t 类型直接参与指针运算，既未经过 LongToSize 转换（仅 length 经过了），也未与文件实际大小进行比较。当 offset 超出 data 缓冲区（大小为 file_size）范围时，memcpy_s 仍会照常执行拷贝，产生堆越界读取。

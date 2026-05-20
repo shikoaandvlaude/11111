@@ -291,3 +291,27 @@ if (location.find("..") != std::string::npos ||
 - CVE-2024-27318 (ONNX 同类漏洞): https://nvd.nist.gov/vuln/detail/CVE-2024-27318
 - CVE-2025-51480 (ONNX 同类漏洞): https://nvd.nist.gov/vuln/detail/CVE-2025-51480
 - MindSpore 安全政策: https://gitee.com/mindspore/community/blob/master/security/README.md
+
+---
+
+## 附录 A: 漏洞复现截图
+
+[在此粘贴 image1 截图]
+
+图 A-1: MS-2025-001 路径穿越漏洞完整复现过程。在 WSL Ubuntu 环境中，首先运行 poc_001.py 生成恶意 .mindir 模型文件（穿越路径为 ../../../../etc/hostname），随后使用 strace 跟踪 MindSpore 2.9.0 加载该模型时的系统调用。strace 输出显示 openat(AT_FDCWD, "/home/kiro/poc/poc_model/../../../../etc/hostname", O_RDONLY) = 3，返回值 3 表示文件描述符成功分配，证明操作系统已打开穿越后的目标文件 /etc/hostname 并将其内容读入进程内存。
+
+---
+
+## 附录 B: 漏洞源码截图
+
+[在此粘贴源码截图: 第 1058 行附近 std::string file = mindir_path_ + "/" + location]
+
+图 B-1: 漏洞根因代码。load_model.cc 中 GetTensorDataFromExternal() 函数将 mindir_path_ 与 tensor_proto.external_data().location() 直接拼接为文件路径，location 字段来自 protobuf 反序列化，完全由模型文件内容控制，此处无任何路径过滤或规范化校验。
+
+[在此粘贴源码截图: 第 1077 行附近 std::basic_ifstream<char> fid(file, ...)]
+
+图 B-2: 文件打开操作。使用拼接后的路径直接创建 ifstream 打开文件，攻击者构造的穿越路径（如 ../../../../etc/passwd）在此被操作系统正常解析并执行文件打开操作。
+
+[在此粘贴源码截图: 第 1092 行附近 (void)fid.read(plain_data.get(), ...)]
+
+图 B-3: 文件完整读入内存。通过 fid.read() 将目标文件的全部内容一次性读入堆缓冲区 plain_data，此时任意文件的内容已完整进入进程内存空间，即使后续字节序检查失败，文件读取操作已不可逆地完成。
