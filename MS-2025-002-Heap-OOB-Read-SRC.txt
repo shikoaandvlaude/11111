@@ -1,6 +1,6 @@
 MindSpore 安全漏洞报告
 
-报告编号: MS-2025-002
+报告编号: MS-2026-002
 标题: MindIR External Data Offset/Length 堆越界读取
 报告日期: 2026-05-20
 报告人: [你的名字/ID]
@@ -42,6 +42,8 @@ external_data.offset 字段作为源缓冲区偏移量, 通过 huge_memcpy 执�
 1. DoS (崩溃): 大 offset 指向未映射页面时触发 segfault, 进程终止
 2. 信息泄露: 读取堆上相邻数据 (可能包含其他模型参数、密钥、用户数据)
 3. ASLR 绕过辅助: 在某些条件下可泄露堆布局信息
+4. 双向越界: 由于 offset 不经过 LongToSize 转换, 负数 offset 可向低地址
+   方向越界读取, 攻击面比一般 OOB 更广 (正/负两个方向均可利用)
 
 
 四、技术细节
@@ -258,7 +260,7 @@ weight_buffer_ 分支有边界检查:
     适当 offset -> 读取堆上相邻的 tensor / 字符串 / 配置数据
     适用于多租户 AI 平台
 
-场景 3: 与 MS-2025-001 组合
+场景 3: 与 MS-2026-001 组合
     先用路径穿越读入已知文件 (控制堆布局), 再用 OOB 读相邻数据
     (理论可行, 需要进一步工程验证)
 
@@ -314,7 +316,7 @@ weight_buffer_ 分支有边界检查:
 
 [在此粘贴 image2 截图]
 
-图 A-1: MS-2025-002 堆越界读取漏洞复现 (Segmentation fault)。
+图 A-1: MS-2026-002 堆越界读取漏洞复现 (Segmentation fault)。
 构造恶意模型文件, 外部数据文件 data.bin 仅 64 字节, 但 external_data.offset
 设置为 0x7FFFFFFF (2147483647), 远超文件实际大小。MindSpore 2.9.0 加载该模型后,
 data + offset 指针指向未映射的内存页面, 触发 Segmentation fault, 进程立即终止。
@@ -323,9 +325,9 @@ data + offset 指针指向未映射的内存页面, 触发 Segmentation fault, �
 
 [在此粘贴 image3 截图]
 
-图 A-2: MS-2025-002 Valgrind 内存错误精确检测。
+图 A-2: MS-2026-002 Valgrind 内存错误精确检测。
 使用 PYTHONMALLOC=malloc valgrind --tool=memcheck 运行 MindSpore 加载恶意模型
-(offset=128, 文件大小 64 字节), Valgrind 检测到多次 "Invalid read of size 8"。
+(offset 超出文件大小, 文件仅 64 字节), Valgrind 检测到多次 "Invalid read of size 8"。
 调用栈清晰显示越界读取发生在:
 memmove -> memcpy_s (libmindspore_frontend.so) -> libmindspore_core.so
 与源码中 GetTensorDataFromExternal() 通过 huge_memcpy 调用 memcpy_s 的执行路径

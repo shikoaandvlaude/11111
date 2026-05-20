@@ -1,6 +1,6 @@
 MindSpore 安全漏洞报告
 
-报告编号: MS-2025-001
+报告编号: MS-2026-001
 标题: MindIR External Data 路径穿越导致任意文件读取
 报告日期: 2026-05-20
 报告人: [你的名字/ID]
@@ -15,6 +15,8 @@ MindSpore 安全漏洞报告
 运行平台:       x86_64 Linux
 严重性:         Critical
 CVSS 3.1 评分:  8.6 (AV:L/AC:L/PR:N/UI:R/S:C/C:H/I:N/A:N)
+                注: 攻击者无需本地账户, 仅需诱导受害者加载恶意模型文件
+                (UI:R), 故 PR:N。在模型分享平台场景下 AV 可视为 Network。
 CWE 分类:       CWE-22 (Improper Limitation of a Pathname to a Restricted Directory)
 攻击向量:       本地 / 需要用户加载恶意模型文件
 影响组件:       mindspore/core/load_mindir/load_model.cc
@@ -298,7 +300,7 @@ mindir_path_ 的来源 (同一文件):
 
 [在此粘贴 image1 截图]
 
-图 A-1: MS-2025-001 路径穿越漏洞完整复现过程。
+图 A-1: MS-2026-001 路径穿越漏洞完整复现过程。
 在 WSL Ubuntu 环境中, 首先运行 poc_001.py 生成恶意 .mindir 模型文件
 (穿越路径为 ../../../../etc/hostname), 随后使用 strace 跟踪 MindSpore 2.9.0
 加载该模型时的系统调用。strace 输出显示:
