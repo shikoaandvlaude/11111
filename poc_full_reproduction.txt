@@ -1,9 +1,9 @@
-==============================================================
+
   HRConvert2 Shell Glob Injection PoC
   Vulnerability: CWE-78 / CWE-155 (Wildcard/Glob Injection)
   Affected: HRConvert2 <= 3.4.7
   Author: cenyuhan0324
-==============================================================
+
 
 SUMMARY:
   The ? character passes through sanitizeString() in strict mode.
@@ -14,9 +14,9 @@ PREREQUISITES:
   - Linux/macOS/WSL with PHP installed (php-cli)
   - No HRConvert2 installation needed
 
-==============================================================
+
 REPRODUCTION STEPS
-==============================================================
+
 
 --- STEP 1: Setup test environment ---
 
